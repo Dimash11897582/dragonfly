@@ -94,6 +94,20 @@ func WithDigest(d *digest.Digest) TaskOption {
 	}
 }
 
+// WithPieceLength set PieceLength for task.
+func WithPieceLength(pieceLength int64) TaskOption {
+	return func(t *Task) {
+		t.PieceLength = pieceLength
+	}
+}
+
+// WithConcurrentPieceCount set ConcurrentPieceCount for task.
+func WithConcurrentPieceCount(concurrentPieceCount int32) TaskOption {
+	return func(t *Task) {
+		t.ConcurrentPieceCount = concurrentPieceCount
+	}
+}
+
 // Task contains content for task.
 type Task struct {
 	// ID is task id.
@@ -125,6 +139,12 @@ type Task struct {
 
 	// ContentLength is task total content length.
 	ContentLength *atomic.Int64
+
+	// PieceLength is piece length.
+	PieceLength int64
+
+	// ConcurrentPieceCount is concurrent piece count.
+	ConcurrentPieceCount int32
 
 	// TotalPieceCount is total piece count.
 	TotalPieceCount *atomic.Int32
@@ -294,6 +314,7 @@ func (t *Task) AddPeerEdge(fromPeer *Peer, toPeer *Peer) error {
 
 	fromPeer.Host.UploadCount.Inc()
 	fromPeer.Host.ConcurrentUploadCount.Inc()
+	fromPeer.Host.TxBandwidth.Add(t.PeakBandwidthUsage())
 	t.Log.Infof("increment %s concurrent upload count, because of add edge from %s to %s", fromPeer.Host.ID, fromPeer.ID, toPeer.ID)
 	return nil
 }
@@ -305,15 +326,19 @@ func (t *Task) DeletePeerInEdges(key string) error {
 		return err
 	}
 
+	var txBandwidth uint64
 	for _, parent := range vertex.Parents.Values() {
 		if parent.Value == nil {
 			continue
 		}
 
+		txBandwidth += t.PeakBandwidthUsage()
 		parent.Value.Host.ConcurrentUploadCount.Dec()
 		t.Log.Infof("decrement %s concurrent upload count, because of delete edge from %s to %s", parent.Value.Host.ID, parent.Value.ID, key)
 	}
 
+	vertex.Value.Host.TxBandwidth.Sub(txBandwidth)
+	t.Log.Infof("decrement %s tx bandwidth %d, because of delete in edge to %s", vertex.Value.Host.ID, txBandwidth, key)
 	if err := t.DAG.DeleteVertexInEdges(key); err != nil {
 		return err
 	}
@@ -332,9 +357,18 @@ func (t *Task) DeletePeerOutEdges(key string) error {
 	if peer == nil {
 		return errors.New("vertex value is nil")
 	}
+
+	for _, child := range vertex.Children.Values() {
+		if child.Value == nil {
+			continue
+		}
+
+		t.Log.Infof("decrement %s tx bandwidth %d, because of delete out edge from %s to %s", child.Value.Host.ID, t.PeakBandwidthUsage(), key, child.Value.ID)
+		child.Value.Host.TxBandwidth.Sub(t.PeakBandwidthUsage())
+	}
+
 	peer.Host.ConcurrentUploadCount.Sub(int32(vertex.Children.Len()))
 	t.Log.Infof("decrement %s concurrent upload count %d, because of delete out edge from %s", peer.Host.ID, vertex.Children.Len(), key)
-
 	if err := t.DAG.DeleteVertexOutEdges(key); err != nil {
 		return err
 	}
@@ -448,6 +482,11 @@ func (t *Task) LoadPiece(key int32) (*Piece, bool) {
 // StorePiece set piece.
 func (t *Task) StorePiece(piece *Piece) {
 	t.Pieces.Store(piece.Number, piece)
+}
+
+// PeakBandwidthUsage returns peak bandwidth usage of the task, uinit is bps.
+func (t *Task) PeakBandwidthUsage() uint64 {
+	return uint64(t.PieceLength) * uint64(t.ConcurrentPieceCount) * 8
 }
 
 // DeletePiece deletes piece for a key.

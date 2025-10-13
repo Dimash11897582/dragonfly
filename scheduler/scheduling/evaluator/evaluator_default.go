@@ -26,6 +26,9 @@ import (
 )
 
 const (
+	// defaultLoadQualityWeight is the weight of load quality.
+	defaultLoadQualityWeight = 0.6
+
 	// defaultHostTypeWeight is the weight of host type.
 	defaultIDCAffinityWeight = 0.2
 
@@ -34,6 +37,17 @@ const (
 
 	// defaultHostTypeWeight is the weight of host type.
 	defaultHostTypeWeight = 0.1
+)
+
+const (
+	// defaultPeakBandwidthUsageWeight is the weight of peak bandwidth usage.
+	defaultPeakBandwidthUsageWeight = 0.5
+
+	// defaultBandwidthDurationWeight is the weight of bandwidth duration.
+	defaultBandwidthDurationWeight = 0.3
+
+	// defaultConcurrencyWeight is the weight of concurrency.
+	defaultConcurrencyWeight = 0.2
 )
 
 // evaluatorDefault is an implementation of Evaluator.
@@ -47,11 +61,11 @@ func newEvaluatorDefault() Evaluator {
 }
 
 // EvaluateParents sort parents by evaluating multiple feature scores.
-func (e *evaluatorDefault) EvaluateParents(parents []*standard.Peer, child *standard.Peer, totalPieceCount uint32) []*standard.Peer {
+func (e *evaluatorDefault) EvaluateParents(parents []*standard.Peer, child *standard.Peer) []*standard.Peer {
 	sort.Slice(
 		parents,
 		func(i, j int) bool {
-			return e.evaluateParents(parents[i], child, totalPieceCount) > e.evaluateParents(parents[j], child, totalPieceCount)
+			return e.evaluateParents(parents[i], child) > e.evaluateParents(parents[j], child)
 		},
 	)
 
@@ -59,23 +73,51 @@ func (e *evaluatorDefault) EvaluateParents(parents []*standard.Peer, child *stan
 }
 
 // evaluateParents sort parents by evaluating multiple feature scores.
-func (e *evaluatorDefault) evaluateParents(parent *standard.Peer, child *standard.Peer, totalPieceCount uint32) float64 {
-	parentLocation := parent.Host.Network.Location
-	parentIDC := parent.Host.Network.IDC
-	childLocation := child.Host.Network.Location
-	childIDC := child.Host.Network.IDC
+func (e *evaluatorDefault) evaluateParents(parent *standard.Peer, child *standard.Peer) float64 {
+	return defaultLoadQualityWeight*e.calculateLoadQualityScore(parent, child) +
+		defaultIDCAffinityWeight*e.calculateIDCAffinityScore(parent.Host.Network.IDC, child.Host.Network.IDC) +
+		defaultLocationAffinityWeight*e.calculateLocationAffinityScore(parent.Host.Network.Location, child.Host.Network.Location) +
+		defaultHostTypeWeight*e.calculateHostTypeScore(parent)
+}
 
-	return defaultHostTypeWeight*e.calculateHostTypeScore(parent) +
-		defaultIDCAffinityWeight*e.calculateIDCAffinityScore(parentIDC, childIDC) +
-		defaultLocationAffinityWeight*e.calculateMultiElementAffinityScore(parentLocation, childLocation)
+// calculateLoadQualityScore 0.0~1.0 larger and better.
+func (e *evaluatorDefault) calculateLoadQualityScore(parent *standard.Peer, child *standard.Peer) float64 {
+	return defaultPeakBandwidthUsageWeight*e.calculatePeakBandwidthUsageScore(parent) +
+		defaultBandwidthDurationWeight*e.calculateBandwidthDurationScore(parent, child) +
+		defaultConcurrencyWeight*e.calculateConcurrencyScore(parent, child)
+}
+
+// calculatePeakBandwidthUsageScore 0.0~1.0 larger and better.
+func (e *evaluatorDefault) calculatePeakBandwidthUsageScore(parent *standard.Peer) float64 {
+	maxTxBandwidth := parent.Host.Network.MaxTxBandwidth
+	if maxTxBandwidth == 0 {
+		return minScore
+	}
+
+	txBandwidth := parent.Host.TxBandwidth.Load()
+	if txBandwidth >= maxTxBandwidth {
+		return minScore
+	}
+
+	return 1 - float64(txBandwidth)/float64(maxTxBandwidth)
+}
+
+// calculateBandwidthDurationScore 0.0~1.0 larger and better.
+func (e *evaluatorDefault) calculateBandwidthDurationScore(parent *standard.Peer, child *standard.Peer) float64 {
+	return minScore
+}
+
+// calculateConcurrencyScore 0.0~1.0 larger and better.
+func (e *evaluatorDefault) calculateConcurrencyScore(parent *standard.Peer, child *standard.Peer) float64 {
+	return minScore
 }
 
 // EvaluatePersistentCacheParents sort persistent cache parents by evaluating multiple feature scores.
-func (e *evaluatorDefault) EvaluatePersistentCacheParents(parents []*persistentcache.Peer, child *persistentcache.Peer, totalPieceCount uint32) []*persistentcache.Peer {
+func (e *evaluatorDefault) EvaluatePersistentCacheParents(parents []*persistentcache.Peer, child *persistentcache.Peer) []*persistentcache.Peer {
 	sort.Slice(
 		parents,
 		func(i, j int) bool {
-			return e.evaluatePersistentCacheParents(parents[i], child, totalPieceCount) > e.evaluatePersistentCacheParents(parents[j], child, totalPieceCount)
+			return e.evaluatePersistentCacheParents(parents[i], child) > e.evaluatePersistentCacheParents(parents[j], child)
 		},
 	)
 
@@ -83,31 +125,9 @@ func (e *evaluatorDefault) EvaluatePersistentCacheParents(parents []*persistentc
 }
 
 // evaluatePersistentCacheParents sort persistent cache parents by evaluating multiple feature scores.
-func (e *evaluatorDefault) evaluatePersistentCacheParents(parent *persistentcache.Peer, child *persistentcache.Peer, totalPieceCount uint32) float64 {
-	parentLocation := parent.Host.Network.Location
-	parentIDC := parent.Host.Network.IDC
-	childLocation := child.Host.Network.Location
-	childIDC := child.Host.Network.IDC
-
-	return defaultIDCAffinityWeight*e.calculateIDCAffinityScore(parentIDC, childIDC) +
-		defaultLocationAffinityWeight*e.calculateMultiElementAffinityScore(parentLocation, childLocation)
-}
-
-// calculateHostTypeScore 0.0~1.0 larger and better.
-func (e *evaluatorDefault) calculateHostTypeScore(peer *standard.Peer) float64 {
-	// When the task is downloaded for the first time,
-	// peer will be scheduled to seed peer first,
-	// otherwise it will be scheduled to dfdaemon first.
-	if peer.Host.Type != types.HostTypeNormal {
-		if peer.FSM.Is(standard.PeerStateReceivedNormal) ||
-			peer.FSM.Is(standard.PeerStateRunning) {
-			return maxScore
-		}
-
-		return minScore
-	}
-
-	return maxScore * 0.5
+func (e *evaluatorDefault) evaluatePersistentCacheParents(parent *persistentcache.Peer, child *persistentcache.Peer) float64 {
+	return defaultIDCAffinityWeight*e.calculateIDCAffinityScore(parent.Host.Network.IDC, child.Host.Network.IDC) +
+		defaultLocationAffinityWeight*e.calculateLocationAffinityScore(parent.Host.Network.Location, child.Host.Network.Location)
 }
 
 // calculateIDCAffinityScore 0.0~1.0 larger and better.
@@ -124,7 +144,7 @@ func (e *evaluatorDefault) calculateIDCAffinityScore(dst, src string) float64 {
 }
 
 // calculateMultiElementAffinityScore 0.0~1.0 larger and better.
-func (e *evaluatorDefault) calculateMultiElementAffinityScore(dst, src string) float64 {
+func (e *evaluatorDefault) calculateLocationAffinityScore(dst, src string) float64 {
 	if dst == "" || src == "" {
 		return minScore
 	}
@@ -151,4 +171,21 @@ func (e *evaluatorDefault) calculateMultiElementAffinityScore(dst, src string) f
 	}
 
 	return float64(score) / float64(maxElementLen)
+}
+
+// calculateHostTypeScore 0.0~1.0 larger and better.
+func (e *evaluatorDefault) calculateHostTypeScore(peer *standard.Peer) float64 {
+	// When the task is downloaded for the first time,
+	// peer will be scheduled to seed peer first,
+	// otherwise it will be scheduled to dfdaemon first.
+	if peer.Host.Type != types.HostTypeNormal {
+		if peer.FSM.Is(standard.PeerStateReceivedNormal) ||
+			peer.FSM.Is(standard.PeerStateRunning) {
+			return maxScore
+		}
+
+		return minScore
+	}
+
+	return maxScore * 0.5
 }
